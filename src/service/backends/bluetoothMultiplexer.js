@@ -5,6 +5,8 @@
 export const DEFAULT_CHANNEL = 'a0d0aaf4-1072-4d81-aa35-902a954b1266';
 // KDE Connect Android's receive buffer, also used as our receive window.
 export const BUFFER_SIZE = 4096;
+// Fork policy chosen under the owner's authorization to select resource limits.
+export const MAX_PAYLOAD_CHANNELS = 64;
 const HEADER_SIZE = 19;
 
 /**
@@ -176,6 +178,7 @@ export class Multiplexer {
             if (type === 1) {
                 if (channel)
                     throw new Error('Duplicate Bluetooth channel');
+                this.checkChannelCapacity();
                 channel = new ByteChannel(this, uuid);
                 this.channels.set(uuid, channel);
             } else if (channel && type === 2) {
@@ -200,10 +203,19 @@ export class Multiplexer {
     }
 
     async open(uuid) {
+        this.checkChannelCapacity();
         const channel = new ByteChannel(this, uuid);
         this.channels.set(uuid, channel);
         await this.send(1, uuid);
         return channel;
+    }
+
+    checkChannelCapacity() {
+        // Include closed-but-unclaimed payloads; reserve the default channel.
+        if (this.channels.size - 1 >= MAX_PAYLOAD_CHANNELS) {
+            this.close();
+            throw new Error('Bluetooth payload channel limit reached');
+        }
     }
 
     claim(uuid) {

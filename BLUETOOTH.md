@@ -69,12 +69,31 @@ There is one reader and serialized frame writer per RFCOMM connection. Packet
 writes are serialized separately so concurrent plugin requests cannot interleave
 JSON lines. Partial reads and UTF-8 characters split across frames are supported.
 
+Packet lines, including the initial identity, are limited to 32 MiB of UTF-8
+bytes before the newline. This matches `BluetoothLink.MAX_PACKET_SIZE` in the
+pinned Android implementation for ordinary packets. Its Bluetooth identity reader
+has no separate bound; this fork applies the same cap there. Packet assembly
+stores bytes in pages, scans each received byte once, and joins pages once.
+
+Each connection retains at most 64 payload channels, including locally opened,
+active, and remotely closed but unclaimed channels. The default packet channel
+is separate. This is fork policy selected under the owner's authorization to
+choose sane values, not a limit specified by KDE's multiplexing protocol. It
+permits concurrent payloads while bounding retained state. Exceeding either the
+packet-line or channel limit closes the connection.
+
 Only known, nonnegative, JavaScript-safe integer payload sizes are supported.
 Unknown-length streams are rejected. Cancellation conservatively closes the
 Bluetooth connection, waking blocked packet and payload writers; reconnect can
 restore the device. EOF, invalid control lengths, repeated/unsupported version
 negotiation, duplicate OPEN, and writes beyond granted receive credit close the
 connection. Remotely closed payload channels retain buffered data until claimed.
+
+Cached Bluetooth notification icons consume the incoming payload without writing
+the cached file again. Unpaired and unsupported packets reject their payloads so
+Android's serial sender can continue. Upload cancellation covers channel opening;
+failed metadata validation and transfer errors close streams and release retained
+channels. A failed packet send releases the device's queue lock for reconnects.
 
 SFTP still requires IP networking and does not work over this transport.
 There is no new Bluetooth settings UI or automatic LAN preference/failover policy.
@@ -88,12 +107,13 @@ Run the focused framework-independent Jasmine suite from the checkout:
 ```sh
 node installed-tests/run-bluetooth-tests.mjs
 node --experimental-vm-modules installed-tests/test-bluetooth-pairing.mjs
+node --experimental-vm-modules installed-tests/test-bluetooth-lifecycle.mjs
 ```
 
 The runner uses the repository's bundled Jasmine implementation as a script,
 adapting its export declaration because its GJS build expects global top-level
-`this`. It runs the suites registered as `BluetoothMultiplexer` and
-`BluetoothIdentity` in Meson.
+`this`. It runs the suites registered as `BluetoothMultiplexer`,
+`BluetoothIdentity`, and `BluetoothPacketReader` in Meson.
 Node's module-type warning is expected in this existing package layout.
 
 The suite checks the official header bytes, byte-fragmented packet traffic across
@@ -102,13 +122,21 @@ uncredited writes, malformed control lengths, closure while awaiting credit,
 and payload UUID validation. Authorization tests reject a copied certificate from
 a different peer, missing Bluetooth approval, and missing or changed pins. They
 allow the approved peer to reconnect and new peers to enter ordinary pairing.
+Resource tests cover retained channel limits, packet byte limits, fragmented
+UTF-8, multiple lines per read, and EOF before a line terminator.
 The pairing check loads the complete device module with framework substitutes.
 It covers incoming protocol 8 approval, stale Accept after channel replacement
 and after a new request, and rejection of stale protocol 8 timestamps. The
 timestamp check uses the active channel's identity and `Math.abs`.
+This timestamp validation also applies to incoming protocol 8 pairing over LAN.
+It rejects nonnumeric and nonfinite timestamps before comparison. Lifecycle
+checks load the production backend and notification modules with framework
+substitutes. They cover stream cleanup on invalid metadata, read/write failures,
+opening failure, cancellation before and during opening, cached icon draining,
+ignored payload rejection, and recovery of packet sending after reconnect.
 
-Neither runner loads Gio, registers a BlueZ profile,
-exercises certificate parsing, or tests the device pairing UI.
+These runners do not load Gio, register a BlueZ profile, exercise certificate
+parsing, or test the device pairing UI.
 
 The source files and suite pass the repository ESLint configuration, including
 its formatting rules. `git diff --check` passes. Node used here was v24.22.1.

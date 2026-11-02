@@ -435,15 +435,19 @@ const Device = GObject.registerClass({
                 return this._handlePair(packet);
 
             // The device must think we're paired; inform it we are not
-            if (!this.paired)
+            if (!this.paired) {
+                this.rejectTransfer(packet);
                 return this.unpair();
+            }
 
             const handler = this._handlers.get(packet.type);
 
-            if (handler !== undefined)
+            if (handler !== undefined) {
                 handler.handlePacket(packet);
-            else
+            } else {
+                this.rejectTransfer(packet);
                 debug(`Unsupported packet type (${packet.type})`, this.name);
+            }
         } catch (e) {
             debug(e, this.name);
         }
@@ -455,6 +459,7 @@ const Device = GObject.registerClass({
      * @param {object} packet - An object of packet data...
      */
     async sendPacket(packet) {
+        let ownsQueue = false;
         try {
             if (!this.connected)
                 return;
@@ -468,19 +473,24 @@ const Device = GObject.registerClass({
                 return;
 
             this._outputLock = true;
+            ownsQueue = true;
             let next;
 
             while ((next = this._outputQueue.shift())) {
-                await this.channel.sendPacket(next);
-                debug(next, this.name);
+                try {
+                    await this.channel.sendPacket(next);
+                    debug(next, this.name);
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        debug(e, this.name);
+                }
             }
-
-            this._outputLock = false;
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.name);
-
-            this._outputLock = false;
+        } finally {
+            if (ownsQueue)
+                this._outputLock = false;
         }
     }
 
@@ -985,8 +995,9 @@ const Device = GObject.registerClass({
             if (this._incomingPairRequest) {
                 if (this.channel?.identity.body.protocolVersion >= 8) {
                     const currentTimestamp = Math.floor(Date.now() / 1000);
-                    const diffTimestamp = Math.abs(this._pairingTimestamp - currentTimestamp);
-                    if (diffTimestamp > ALLOWED_TIMESTAMP_TIME_DIFFERENCE_SECONDS) {
+                    if (!Number.isFinite(this._pairingTimestamp) ||
+                        Math.abs(this._pairingTimestamp - currentTimestamp) >
+                        ALLOWED_TIMESTAMP_TIME_DIFFERENCE_SECONDS) {
                         this._setPaired(false);
                         this.showNotification({
                             id: 'pair-request',

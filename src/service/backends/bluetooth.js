@@ -9,8 +9,9 @@ import GObject from 'gi://GObject';
 import Config from '../../config.js';
 import * as Core from '../core.js';
 import Device from '../device.js';
-import {BUFFER_SIZE, DEFAULT_CHANNEL, Multiplexer} from './bluetoothMultiplexer.js';
+import {BUFFER_SIZE, DEFAULT_CHANNEL, Multiplexer, validUuid} from './bluetoothMultiplexer.js';
 import {authorizePeer} from './bluetoothIdentity.js';
+import {PacketReader} from './bluetoothPacketReader.js';
 
 const SERVICE_UUID = '185f3df4-3268-4e3f-9fca-d4d5059915bd';
 const PROFILE_PATH = '/org/gnome/Shell/Extensions/GSConnect/Bluetooth';
@@ -238,7 +239,6 @@ export const Channel = GObject.registerClass({
         this.backend = backend;
         this.path = path;
         this._connection = connection;
-        this._lines = new Uint8Array();
         this._packets = Promise.resolve();
         this.mux = new Multiplexer({
             read: count => readBytes(connection.input_stream, count, this.cancellable),
@@ -250,6 +250,7 @@ export const Channel = GObject.registerClass({
             },
         }, () => this.close());
         this._main = this.mux.channels.get(DEFAULT_CHANNEL);
+        this._reader = new PacketReader(() => this._main.read());
     }
 
     get address() {
@@ -306,18 +307,11 @@ export const Channel = GObject.registerClass({
     }
 
     async readPacket() {
-        while (true) {
-            const end = this._lines.indexOf(10);
-            if (end !== -1) {
-                const line = this._lines.slice(0, end);
-                this._lines = this._lines.slice(end + 1);
-                return new Core.Packet(new TextDecoder('utf-8', {fatal: true}).decode(line));
-            }
-            const chunk = await this._main.read();
-            const bytes = new Uint8Array(this._lines.length + chunk.length);
-            bytes.set(this._lines);
-            bytes.set(chunk, this._lines.length);
-            this._lines = bytes;
+        try {
+            return new Core.Packet(await this._reader.readLine());
+        } catch (error) {
+            this.close();
+            throw error;
         }
     }
 
@@ -328,7 +322,7 @@ export const Channel = GObject.registerClass({
         return sent;
     }
 
-    async _payload(channel, stream, operation, cancellable) {
+    async _payload(uuid, stream, operation, cancellable) {
         // Closing RFCOMM also wakes a packet write waiting for main credit.
         const cancel = () => this.close();
         const id = cancellable?.connect(cancel);
@@ -339,36 +333,41 @@ export const Channel = GObject.registerClass({
         } finally {
             if (id)
                 cancellable.disconnect(id);
-            channel.close();
-            this.mux.channels.delete(channel.uuid);
-            await stream.close_async(GLib.PRIORITY_DEFAULT, null).catch(error => debug(error));
+            if (validUuid(uuid) && uuid !== DEFAULT_CHANNEL) {
+                this.mux.channels.get(uuid)?.close();
+                this.mux.channels.delete(uuid);
+            }
+            if (stream)
+                await stream.close_async(GLib.PRIORITY_DEFAULT, null).catch(error => debug(error));
         }
     }
 
     async download(packet, target, cancellable = null) {
-        const channel = this.mux.claim(packet.payloadTransferInfo?.uuid);
-        if (!Number.isSafeInteger(packet.payloadSize) || packet.payloadSize < 0) {
-            channel.close();
-            throw new Error('Unsupported Bluetooth payload size');
-        }
-        await this._payload(channel, target, async () => {
+        await this._payload(packet.payloadTransferInfo?.uuid, target, async () => {
+            const channel = this.mux.claim(packet.payloadTransferInfo?.uuid);
+            if (!Number.isSafeInteger(packet.payloadSize) || packet.payloadSize < 0)
+                throw new Error('Unsupported Bluetooth payload size');
             let remaining = packet.payloadSize;
             while (remaining > 0) {
                 const bytes = await channel.read();
                 if (bytes.length > remaining)
                     throw new Error('Bluetooth payload exceeds declared size');
-                await target.write_all_async(bytes, GLib.PRIORITY_DEFAULT,
-                    cancellable ?? this.cancellable);
+                // A null target consumes a cached payload without storing it.
+                if (target) {
+                    await target.write_all_async(bytes, GLib.PRIORITY_DEFAULT,
+                        cancellable ?? this.cancellable);
+                }
                 remaining -= bytes.length;
             }
         }, cancellable);
     }
 
     async upload(packet, source, size, cancellable = null) {
-        if (!Number.isSafeInteger(size) || size < 0)
-            throw new Error('Unsupported Bluetooth payload size');
-        const channel = await this.mux.open(GLib.uuid_string_random());
-        await this._payload(channel, source, async () => {
+        const uuid = GLib.uuid_string_random();
+        await this._payload(uuid, source, async () => {
+            if (!Number.isSafeInteger(size) || size < 0)
+                throw new Error('Unsupported Bluetooth payload size');
+            const channel = await this.mux.open(uuid);
             packet.payloadSize = size;
             packet.payloadTransferInfo = {uuid: channel.uuid};
             await this.sendPacket(packet);

@@ -30,4 +30,5 @@ environment.addReporter({
 });
 await import('./suites/backends/testBluetoothMultiplexer.js');
 await import('./suites/backends/testBluetoothIdentity.js');
+await import('./suites/backends/testBluetoothPacketReader.js');
 environment.execute();

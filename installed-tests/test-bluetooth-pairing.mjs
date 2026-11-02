@@ -20,6 +20,7 @@ async function fixture() {
     const errors = [];
     const context = vm.createContext({
         logError: error => errors.push(error),
+        debug: error => errors.push(error),
         _: value => value,
     });
     vm.runInContext('String.prototype.format = function () { return String(this); };', context);
@@ -37,6 +38,7 @@ async function fixture() {
         SimpleActionGroup: class {},
         ThemedIcon: class {},
         NotificationPriority: {URGENT: 0},
+        IOErrorEnum: {CANCELLED: 0},
     };
     const GLib = {
         uuid_string_random: randomUUID,
@@ -53,6 +55,17 @@ async function fixture() {
     };
     const module = new vm.SourceTextModule(source, {context});
     await module.link(specifier => {
+        if (specifier === './core.js') {
+            return new vm.SyntheticModule(['Packet'], function () {
+                this.setExport('Packet', class {
+                    constructor(packet) {
+                        if (packet.invalid)
+                            throw new Error('Invalid packet');
+                        Object.assign(this, packet);
+                    }
+                });
+            }, {context});
+        }
         const value = {'gi://Gio': Gio, 'gi://GLib': GLib, 'gi://GObject': GObject}[specifier];
         return new vm.SyntheticModule(['default'], function () {
             this.setExport('default', value ?? {});
@@ -78,6 +91,9 @@ async function fixture() {
         _outgoingPairRequest: 0,
         _procs: new Set(),
         _transfers: new Map(),
+        _handlers: new Map(),
+        _outputLock: false,
+        _outputQueue: [],
         settings: {
             get_string: key => values.get(key) ?? '',
             get_boolean: key => values.get(key) ?? false,
@@ -133,4 +149,53 @@ test('expired protocol 8 timestamps cannot approve pairing', async () => {
     assert.equal(values.get('paired'), false);
     assert.equal(values.has('bluetooth-peer'), false);
     assert.equal(errors.length, 0);
+});
+
+test('nonnumeric and nonfinite protocol 8 timestamps cannot approve pairing', async () => {
+    for (const timestamp of [NaN, Infinity, -Infinity,
+        String(Math.floor(Date.now() / 1000)), null, {}, []]) {
+        const {device, values, errors} = await fixture();
+        device._notifyPairRequest(timestamp);
+        device.pair();
+        assert.equal(values.get('paired'), false);
+        assert.equal(values.has('bluetooth-peer'), false);
+        assert.equal(errors.length, 0);
+    }
+});
+
+test('native send failure releases the queue and reconnect sends queued packets', async () => {
+    const {device, values, peer, errors} = await fixture();
+    delete device.sendPacket;
+    values.set('paired', true);
+    let fail;
+    device.channel.sendPacket = () => new Promise((resolve, reject) => { fail = reject; });
+    const first = device.sendPacket({type: 'first'});
+    // A concurrent caller that fails before queue admission must not unlock it.
+    await device.sendPacket({type: 'invalid', invalid: true});
+    assert.equal(device._outputLock, true);
+    const replacement = peer('/org/bluez/hci0/dev_new');
+    const sent = [];
+    replacement.sendPacket = async packet => sent.push(packet.type);
+    device.setChannel(replacement);
+    await device.sendPacket({type: 'second'});
+    assert.equal(sent.length, 0);
+    fail(new Error('RFCOMM closed'));
+    await first;
+    assert.deepEqual(sent, ['second']);
+    assert.equal(device._outputLock, false);
+    await device.sendPacket({type: 'third'});
+    assert.deepEqual(sent, ['second', 'third']);
+    assert.equal(errors.some(error => error.message === 'RFCOMM closed'), true);
+});
+
+test('unpaired and unsupported packets reject their attached payloads', async () => {
+    const {device, values} = await fixture();
+    const rejected = [];
+    device.channel.rejectTransfer = packet => rejected.push(packet);
+    device.unpair = () => {};
+    const packet = {type: 'kdeconnect.notification', hasPayload: () => true};
+    device.handlePacket(packet);
+    values.set('paired', true);
+    device.handlePacket(packet);
+    assert.deepEqual(rejected, [packet, packet]);
 });

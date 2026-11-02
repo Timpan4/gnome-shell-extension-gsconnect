@@ -9,6 +9,7 @@ backend_tests_metadir = join_paths(installed_tests_metadir, 'backends')
 backend_tests = [
   'BluetoothIdentity',
   'BluetoothMultiplexer',
+  'BluetoothPacketReader',
   'LanBackend',
 ]
 

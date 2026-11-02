@@ -7,7 +7,8 @@ const modulePath = import.meta.url.includes('/suites/backends/')
     ? '../../../src/service/backends/bluetoothMultiplexer.js'
     : `file://${(await import('../config.js')).default.PACKAGE_DATADIR}` +
       '/service/backends/bluetoothMultiplexer.js';
-const {BUFFER_SIZE, DEFAULT_CHANNEL, frame, Multiplexer} = await import(modulePath);
+const {BUFFER_SIZE, DEFAULT_CHANNEL, MAX_PAYLOAD_CHANNELS, frame, Multiplexer} =
+    await import(modulePath);
 
 // A stream that deliberately fragments reads at every byte boundary.
 /**
@@ -195,6 +196,34 @@ describe('Bluetooth multiplexing', function () {
         const read = a.channels.get(DEFAULT_CHANNEL).read();
         ios[0].close();
         await expectAsync(read).toBeRejected();
+        expect(a.closed).toBeTrue();
+    });
+
+    it('bounds remotely opened channels including closed unclaimed payloads', async function () {
+        a.start();
+        b.start();
+        for (let i = 0; i < MAX_PAYLOAD_CHANNELS; i++) {
+            const id = `00000000-1234-4567-89ab-${i.toString(16).padStart(12, '0')}`;
+            const channel = await b.open(id);
+            channel.close();
+        }
+        const barrier = b.channels.get(DEFAULT_CHANNEL).write(new Uint8Array([1]));
+        await a.channels.get(DEFAULT_CHANNEL).read();
+        await barrier;
+        expect(a.channels.size).toBe(MAX_PAYLOAD_CHANNELS + 1);
+        const closed = new Promise(resolve => {
+            a.onClose = resolve;
+        });
+        await b.open(uuid);
+        await closed;
+        expect(a.closed).toBeTrue();
+        expect(a.channels.size).toBe(0);
+    });
+
+    it('applies the same channel bound to local payload opens', async function () {
+        for (let i = 0; i < MAX_PAYLOAD_CHANNELS; i++)
+            await a.open(`00000000-1234-4567-89ab-${i.toString(16).padStart(12, '0')}`);
+        await expectAsync(a.open(uuid)).toBeRejected();
         expect(a.closed).toBeTrue();
     });
 });

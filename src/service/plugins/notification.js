@@ -495,8 +495,14 @@ const NotificationPlugin = GObject.registerClass({
             //       the notification packet, which may cause problems wrt #789
             const file = Gio.File.new_for_path(path);
 
-            if (file.query_exists(null))
+            if (file.query_exists(null)) {
+                // Android sends Bluetooth payloads on its serial send thread.
+                // Consume the icon so that thread can send the next packet.
+                const channel = this.device.channel;
+                if (channel?.address.startsWith('bluetooth://'))
+                    await channel.download(packet, null);
                 return new Gio.FileIcon({file: file});
+            }
 
             // Open the target path and create a transfer
             const transfer = this.device.createTransfer();
