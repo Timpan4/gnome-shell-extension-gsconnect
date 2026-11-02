@@ -39,7 +39,7 @@ sudo.
 ## 3. Download and build
 
 ```sh
-git clone --branch feat/bluetooth-transport --single-branch \
+git clone --branch main --single-branch \
     https://github.com/Timpan4/gnome-shell-extension-gsconnect.git gsconnect-bluetooth
 cd gsconnect-bluetooth
 meson setup _build --prefix=/usr \
