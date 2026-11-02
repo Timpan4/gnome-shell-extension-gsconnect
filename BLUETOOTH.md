@@ -3,6 +3,8 @@
 
 # Bluetooth in the Timpan4 fork
 
+For installation, follow the [Fedora step-by-step guide](INSTALL-FEDORA.md).
+
 This fork implements the KDE Connect Bluetooth multiplexing v1 transport through
 BlueZ Profile1. It is experimental. Protocol tests pass under Node; the GJS,
 BlueZ, Android, and physical radio paths have not been run in this environment.
