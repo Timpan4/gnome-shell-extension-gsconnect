@@ -978,7 +978,7 @@ const Device = GObject.registerClass({
             this._procs.clear();
 
             for (const transfer of this._transfers.values())
-                transfer.close();
+                transfer.cancel();
 
             this._transfers.clear();
         }

@@ -218,3 +218,16 @@ test('a replaced channel read loop cannot consume or dispatch the new channel pa
     assert.equal(handled.length, 0);
     assert.equal(device.channel, replacement);
 });
+
+test('unpairing cancels active transfers and clears authorization and certificate pins', async () => {
+    const {device, values} = await fixture();
+    device._setPaired(true);
+    let cancelled = false;
+    device._transfers.set('active', {cancel() { cancelled = true; }});
+    device._setPaired(false);
+    assert.equal(cancelled, true);
+    assert.equal(values.get('paired'), false);
+    assert.equal(values.has('certificate-pem'), false);
+    assert.equal(values.has('bluetooth-peer'), false);
+    assert.equal(device._transfers.size, 0);
+});

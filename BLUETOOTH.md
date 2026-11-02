@@ -80,8 +80,9 @@ active, and remotely closed but unclaimed channels. The default packet channel
 is separate. This is fork policy selected under the owner's authorization to
 choose sane values, not a limit specified by KDE's multiplexing protocol. It
 permits concurrent payloads while bounding retained state. Oversized packet lines
-or excess channels opened by the peer close the connection. When a local upload
-hits the channel cap, only that upload fails; existing channels stay connected.
+close the connection. Excess peer payload channels receive CLOSE without being
+retained, and excess local uploads fail individually. Existing channels stay
+connected even when local uploads fill the entire budget.
 
 Only known, nonnegative, JavaScript-safe integer payload sizes are supported.
 Unknown-length streams are rejected. Cancellation conservatively closes the

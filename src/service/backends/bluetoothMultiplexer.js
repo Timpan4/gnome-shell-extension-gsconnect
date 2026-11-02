@@ -179,7 +179,12 @@ export class Multiplexer {
             if (type === 1) {
                 if (channel)
                     throw new Error('Duplicate Bluetooth channel');
-                this.checkChannelCapacity();
+                if (this.channels.size - 1 >= MAX_PAYLOAD_CHANNELS) {
+                    // Refuse this payload without disrupting existing traffic.
+                    // Await the reply so rejected OPENs cannot queue up writes.
+                    await this.send(2, uuid);
+                    continue;
+                }
                 channel = new ByteChannel(this, uuid);
                 this.channels.set(uuid, channel);
             } else if (channel && type === 2) {

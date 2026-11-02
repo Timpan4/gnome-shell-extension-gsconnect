@@ -211,18 +211,34 @@ describe('Bluetooth multiplexing', function () {
         await a.channels.get(DEFAULT_CHANNEL).read();
         await barrier;
         expect(a.channels.size).toBe(MAX_PAYLOAD_CHANNELS + 1);
-        const closed = new Promise(resolve => {
-            a.onClose = resolve;
-        });
-        await b.open(uuid);
-        await closed;
-        expect(a.closed).toBeTrue();
-        expect(a.channels.size).toBe(0);
+        const rejected = await b.open(uuid);
+        const next = b.channels.get(DEFAULT_CHANNEL).write(new Uint8Array([2]));
+        await a.channels.get(DEFAULT_CHANNEL).read();
+        await next;
+        expect(rejected.closed).toBeTrue();
+        expect(a.closed).toBeFalse();
+        expect(a.channels.size).toBe(MAX_PAYLOAD_CHANNELS + 1);
     });
 
     it('rejects excess local uploads without disrupting existing channels', async function () {
+        const writes = [];
+        const write = ios[0].write;
+        ios[0].write = bytes => {
+            writes.push(bytes);
+            return write(bytes);
+        };
+        a.start();
+        ios[0].push(frame(0, DEFAULT_CHANNEL, new Uint8Array([0, 1, 0, 1])));
         for (let i = 0; i < MAX_PAYLOAD_CHANNELS; i++)
             await a.open(`00000000-1234-4567-89ab-${i.toString(16).padStart(12, '0')}`);
+        // Android has no channel cap; model its first incoming payload while
+        // our own uploads occupy the entire retained-channel budget.
+        const packet = a.channels.get(DEFAULT_CHANNEL).read();
+        ios[0].push(frame(1, uuid));
+        ios[0].push(frame(4, DEFAULT_CHANNEL, new Uint8Array([1])));
+        await packet;
+        expect(writes.some(bytes => bytes[0] === 2)).toBeTrue();
+        expect(a.channels.has(uuid)).toBeFalse();
         await expectAsync(a.open(uuid)).toBeRejected();
         expect(a.closed).toBeFalse();
         const existing = Array.from(a.channels.values()).find(channel =>
