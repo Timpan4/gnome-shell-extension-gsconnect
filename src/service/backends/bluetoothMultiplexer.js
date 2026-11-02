@@ -49,6 +49,7 @@ class ByteChannel {
         this.credit = 0;
         this.requested = 0;
         this.closed = false;
+        this.claimed = false;
         this.waiters = new Set();
     }
 
@@ -205,23 +206,33 @@ export class Multiplexer {
     async open(uuid) {
         this.checkChannelCapacity();
         const channel = new ByteChannel(this, uuid);
+        channel.claimed = true;
         this.channels.set(uuid, channel);
-        await this.send(1, uuid);
+        try {
+            await this.send(1, uuid);
+        } catch (error) {
+            channel.close();
+            if (this.channels.get(uuid) === channel)
+                this.channels.delete(uuid);
+            throw error;
+        }
         return channel;
     }
 
     checkChannelCapacity() {
         // Include closed-but-unclaimed payloads; reserve the default channel.
-        if (this.channels.size - 1 >= MAX_PAYLOAD_CHANNELS) {
-            this.close();
+        if (this.channels.size - 1 >= MAX_PAYLOAD_CHANNELS)
             throw new Error('Bluetooth payload channel limit reached');
-        }
     }
 
     claim(uuid) {
         if (!validUuid(uuid) || uuid === DEFAULT_CHANNEL || !this.channels.has(uuid))
             throw new Error('Invalid Bluetooth payload channel');
-        return this.channels.get(uuid);
+        const channel = this.channels.get(uuid);
+        if (channel.claimed)
+            throw new Error('Bluetooth payload channel is already claimed');
+        channel.claimed = true;
+        return channel;
     }
 
     close(error = new Error('Bluetooth connection closed')) {

@@ -199,3 +199,22 @@ test('unpaired and unsupported packets reject their attached payloads', async ()
     device.handlePacket(packet);
     assert.deepEqual(rejected, [packet, packet]);
 });
+
+test('a replaced channel read loop cannot consume or dispatch the new channel packets', async () => {
+    const {device, peer} = await fixture();
+    delete device._readLoop;
+    let resolveOld;
+    const previous = device.channel;
+    previous.readPacket = () => new Promise(resolve => { resolveOld = resolve; });
+    const handled = [];
+    device.handlePacket = packet => handled.push(packet);
+    const oldLoop = device._readLoop(previous);
+    const replacement = peer('/org/bluez/hci0/dev_new');
+    replacement.readPacket = () => assert.fail('old loop must not read replacement');
+    // Model replacement after the old read resolves, before its continuation.
+    resolveOld({type: 'old'});
+    device._channel = replacement;
+    await oldLoop;
+    assert.equal(handled.length, 0);
+    assert.equal(device.channel, replacement);
+});

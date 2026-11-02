@@ -220,10 +220,14 @@ describe('Bluetooth multiplexing', function () {
         expect(a.channels.size).toBe(0);
     });
 
-    it('applies the same channel bound to local payload opens', async function () {
+    it('rejects excess local uploads without disrupting existing channels', async function () {
         for (let i = 0; i < MAX_PAYLOAD_CHANNELS; i++)
             await a.open(`00000000-1234-4567-89ab-${i.toString(16).padStart(12, '0')}`);
         await expectAsync(a.open(uuid)).toBeRejected();
-        expect(a.closed).toBeTrue();
+        expect(a.closed).toBeFalse();
+        const existing = Array.from(a.channels.values()).find(channel =>
+            channel.uuid !== DEFAULT_CHANNEL);
+        existing.close();
+        await expectAsync(a.open(uuid)).toBeResolved();
     });
 });

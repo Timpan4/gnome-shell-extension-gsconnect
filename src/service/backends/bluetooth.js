@@ -9,7 +9,7 @@ import GObject from 'gi://GObject';
 import Config from '../../config.js';
 import * as Core from '../core.js';
 import Device from '../device.js';
-import {BUFFER_SIZE, DEFAULT_CHANNEL, Multiplexer, validUuid} from './bluetoothMultiplexer.js';
+import {BUFFER_SIZE, DEFAULT_CHANNEL, Multiplexer} from './bluetoothMultiplexer.js';
 import {authorizePeer} from './bluetoothIdentity.js';
 import {PacketReader} from './bluetoothPacketReader.js';
 
@@ -322,29 +322,41 @@ export const Channel = GObject.registerClass({
         return sent;
     }
 
-    async _payload(uuid, stream, operation, cancellable) {
+    claimPayload(packet) {
+        return this.mux.claim(packet.payloadTransferInfo?.uuid);
+    }
+
+    releasePayload(channel) {
+        if (this.mux.channels.get(channel.uuid) !== channel)
+            return;
+        channel.close();
+        this.mux.channels.delete(channel.uuid);
+    }
+
+    async _payload(channel, stream, operation, cancellable) {
         // Closing RFCOMM also wakes a packet write waiting for main credit.
         const cancel = () => this.close();
         const id = cancellable?.connect(cancel);
         try {
             if (cancellable?.is_cancelled())
                 throw new Error('Bluetooth transfer cancelled');
-            return await operation();
+            return await operation(owned => {
+                channel = owned;
+                return owned;
+            });
         } finally {
             if (id)
                 cancellable.disconnect(id);
-            if (validUuid(uuid) && uuid !== DEFAULT_CHANNEL) {
-                this.mux.channels.get(uuid)?.close();
-                this.mux.channels.delete(uuid);
-            }
+            if (channel)
+                this.releasePayload(channel);
             if (stream)
                 await stream.close_async(GLib.PRIORITY_DEFAULT, null).catch(error => debug(error));
         }
     }
 
-    async download(packet, target, cancellable = null) {
-        await this._payload(packet.payloadTransferInfo?.uuid, target, async () => {
-            const channel = this.mux.claim(packet.payloadTransferInfo?.uuid);
+    async download(packet, target, cancellable = null, reserved = null) {
+        await this._payload(reserved, target, async own => {
+            const channel = reserved ?? own(this.claimPayload(packet));
             if (!Number.isSafeInteger(packet.payloadSize) || packet.payloadSize < 0)
                 throw new Error('Unsupported Bluetooth payload size');
             let remaining = packet.payloadSize;
@@ -363,11 +375,10 @@ export const Channel = GObject.registerClass({
     }
 
     async upload(packet, source, size, cancellable = null) {
-        const uuid = GLib.uuid_string_random();
-        await this._payload(uuid, source, async () => {
+        await this._payload(null, source, async own => {
             if (!Number.isSafeInteger(size) || size < 0)
                 throw new Error('Unsupported Bluetooth payload size');
-            const channel = await this.mux.open(uuid);
+            const channel = own(await this.mux.open(GLib.uuid_string_random()));
             packet.payloadSize = size;
             packet.payloadTransferInfo = {uuid: channel.uuid};
             await this.sendPacket(packet);
@@ -385,9 +396,7 @@ export const Channel = GObject.registerClass({
 
     rejectTransfer(packet) {
         try {
-            const channel = this.mux.claim(packet.payloadTransferInfo?.uuid);
-            channel.close();
-            this.mux.channels.delete(channel.uuid);
+            this.releasePayload(this.claimPayload(packet));
         } catch (error) {
             debug(error);
         }

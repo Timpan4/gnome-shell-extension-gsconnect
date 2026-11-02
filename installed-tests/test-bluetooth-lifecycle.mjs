@@ -31,12 +31,20 @@ async function loadModule(path, overrides = {}) {
         'gi://Gio': {},
         'gi://Gtk': {},
         'gi://GLib': {PRIORITY_DEFAULT: 0, uuid_string_random: randomUUID},
-        'gi://GObject': {registerClass: (options, implementation) => implementation},
+        'gi://GObject': {
+            registerClass: (options, implementation) => implementation,
+            ParamSpec: {boolean() {}, object() {}, string() {}},
+            ParamFlags: {},
+            SignalFlags: {},
+            Object: class {},
+        },
         '../core.js': {Channel: class {}, ChannelService: class {}},
         '../device.js': {default: {}},
         '../plugin.js': {default: class {}},
         '../ui/notification.js': {default: class {}},
         '../components/index.js': {},
+        '../utils/dbus.js': {},
+        '../components/mpris.js': {Player: class {}},
         '../../config.js': {default: {}},
         ...overrides,
     };
@@ -56,7 +64,8 @@ async function loadModule(path, overrides = {}) {
             if (!Object.hasOwn(defaults, specifier))
                 return resolve(new URL(specifier, referencing.identifier));
             const value = defaults[specifier];
-            const exports = Object.hasOwn(value, 'default') || specifier === '../core.js'
+            const exports = Object.hasOwn(value, 'default') ||
+                specifier === '../core.js' || specifier === '../components/mpris.js'
                 ? value : {default: value};
             return new vm.SyntheticModule(Object.keys(exports), function () {
                 for (const [key, entry] of Object.entries(exports))
@@ -168,16 +177,15 @@ test('download success and write failure both release the target and channel', a
 });
 
 test('opening failure closes upload source and removes the partially opened channel', async () => {
-    const {channel, channels, cancellable, listeners} = fixture();
-    channels.clear();
-    channel.mux.open = async id => {
-        channels.set(id, {close() {}});
-        throw new Error('Open failed');
-    };
+    const {channel, cancellable, listeners} = fixture();
+    channel.mux = new Multiplexer({
+        write: () => Promise.reject(new Error('Open failed')),
+        close() {},
+    });
     const source = stream();
     await assert.rejects(channel.upload({}, source, 0, cancellable), /Open failed/);
     assert.equal(source.closed, 1);
-    assert.equal(channels.size, 0);
+    assert.equal(channel.mux.channels.size, 0);
     assert.equal(listeners.size, 0);
 });
 
@@ -186,6 +194,8 @@ test('rejecting an ignored payload wakes a sender waiting for receive credit', a
     channel.mux = new Multiplexer({write: async () => {}, close() {}});
     try {
         const payload = await channel.mux.open(uuid);
+        // Model an incoming OPEN, which has not yet been claimed by a consumer.
+        payload.claimed = false;
         const writer = payload.write(new Uint8Array([1]));
         channel.rejectTransfer({payloadTransferInfo: {uuid}});
         await assert.rejects(writer, /channel closed/);
@@ -196,21 +206,24 @@ test('rejecting an ignored payload wakes a sender waiting for receive credit', a
 });
 
 test('upload cancellation is installed before open and closes the source on rejection', async () => {
-    const {channel, channels, cancellable, listeners} = fixture();
-    channels.clear();
+    const {channel, cancellable, listeners} = fixture();
     let rejectOpen;
-    channel.mux.open = id => {
-        assert.equal(listeners.size, 1);
-        channels.set(id, {close() {}});
-        return new Promise((resolve, reject) => { rejectOpen = reject; });
-    };
-    channel.close = () => rejectOpen(new Error('Connection closed'));
+    channel.mux = new Multiplexer({
+        write() {
+            assert.equal(listeners.size, 1);
+            return new Promise((resolve, reject) => { rejectOpen = reject; });
+        },
+        close() { rejectOpen(new Error('Connection closed')); },
+    });
+    channel.close = () => channel.mux.close();
     const source = stream();
     const result = channel.upload({}, source, 0, cancellable);
+    // Let the serialized frame writer enter the controlled transport write.
+    await Promise.resolve();
     cancellable.cancel();
     await assert.rejects(result, /Connection closed/);
     assert.equal(source.closed, 1);
-    assert.equal(channels.size, 0);
+    assert.equal(channel.mux.channels.size, 0);
     assert.equal(listeners.size, 0);
 });
 
@@ -283,4 +296,102 @@ test('cached Bluetooth notification drains its payload before returning the cach
     assert.equal(payload.reads, 2);
     assert.equal(payload.closed, true);
     assert.equal(channels.size, 0);
+});
+
+test('duplicate downloads release only their own targets and preserve the first owner', async () => {
+    const channel = Object.create(backend.Channel.prototype);
+    channel.mux = new Multiplexer({write: () => Promise.resolve(), close() {}});
+    const payload = await channel.mux.open(uuid);
+    payload.claimed = false; // Incoming OPEN fixture.
+    const packet = {payloadTransferInfo: {uuid}, payloadSize: 1};
+    const firstTarget = stream();
+    const secondTarget = stream();
+    const first = channel.download(packet, firstTarget);
+    await assert.rejects(channel.download(packet, secondTarget), /already claimed/);
+    assert.equal(firstTarget.closed, 0);
+    assert.equal(secondTarget.closed, 1);
+    assert.equal(payload.closed, false);
+    // A rejected duplicate must not break the original transfer.
+    payload.chunks.push(new Uint8Array([42]));
+    payload.buffered++;
+    payload.wake();
+    await first;
+    assert.deepEqual(firstTarget.writes, [42]);
+    assert.equal(firstTarget.closed, 1);
+    assert.equal(channel.mux.channels.has(uuid), false);
+    channel.mux.close();
+});
+
+test('target-open failure rejects the original payload even if the device reconnects', async () => {
+    class File {
+        query_exists() { return false; }
+        async replace_async() { throw new Error('Permission denied'); }
+        delete_async() {}
+    }
+    const file = new File();
+    File.new_for_path = () => file;
+    const Gio = {
+        File,
+        Cancellable: class {},
+        InputStream: class {},
+        OutputStream: class {},
+        FileCreateFlags: {REPLACE_DESTINATION: 0},
+    };
+    const Core = await loadModule('../src/service/core.js', {
+        'gi://Gio': Gio,
+        './device.js': {default: {}},
+        './plugins/index.js': {default: {}},
+    });
+    const {default: Notification} = await loadModule('../src/service/plugins/notification.js', {
+        'gi://Gio': Gio,
+        'gi://GLib': {
+            VariantType: class {},
+            path_get_basename: value => value,
+            build_filenamev: parts => parts.join('/'),
+        },
+    });
+    const channel = Object.create(backend.Channel.prototype);
+    channel.mux = new Multiplexer({write: () => Promise.resolve(), close() {}});
+    const payload = await channel.mux.open(uuid);
+    payload.claimed = false; // Incoming OPEN fixture.
+    const writer = payload.write(new Uint8Array([1]));
+    const settledWriter = assert.rejects(writer, /channel closed/);
+    const plugin = Object.create(Notification.prototype);
+    plugin.device = {
+        channel,
+        createTransfer() {
+            const transfer = Object.create(Core.Transfer.prototype);
+            transfer._items = [];
+            transfer._cancellable = new Gio.Cancellable();
+            transfer.device = plugin.device;
+            transfer.notify = () => {};
+            return transfer;
+        },
+    };
+    file.replace_async = () => {
+        plugin.device.channel = {rejectTransfer() { assert.fail('wrong channel'); }};
+        return Promise.reject(new Error('Permission denied'));
+    };
+    const icon = await plugin._downloadIcon(new Core.Packet({
+        type: 'kdeconnect.notification',
+        body: {payloadHash: 'uncached'},
+        payloadTransferInfo: {uuid},
+        payloadSize: 1,
+    }));
+    assert.equal(icon, null);
+    await settledWriter;
+    assert.equal(payload.closed, true);
+    assert.equal(channel.mux.channels.has(uuid), false);
+    channel.mux.close();
+});
+
+test('album art for a removed player rejects its payload', async () => {
+    const {default: Mpris} = await loadModule('../src/service/plugins/mpris.js');
+    const plugin = Object.create(Mpris.prototype);
+    const rejected = [];
+    plugin._players = new Map();
+    plugin.device = {rejectTransfer: packet => rejected.push(packet)};
+    const packet = {body: {player: 'removed', transferringAlbumArt: true}};
+    plugin._handlePlayerUpdate(packet);
+    assert.deepEqual(rejected, [packet]);
 });

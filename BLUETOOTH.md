@@ -79,8 +79,9 @@ Each connection retains at most 64 payload channels, including locally opened,
 active, and remotely closed but unclaimed channels. The default packet channel
 is separate. This is fork policy selected under the owner's authorization to
 choose sane values, not a limit specified by KDE's multiplexing protocol. It
-permits concurrent payloads while bounding retained state. Exceeding either the
-packet-line or channel limit closes the connection.
+permits concurrent payloads while bounding retained state. Oversized packet lines
+or excess channels opened by the peer close the connection. When a local upload
+hits the channel cap, only that upload fails; existing channels stay connected.
 
 Only known, nonnegative, JavaScript-safe integer payload sizes are supported.
 Unknown-length streams are rejected. Cancellation conservatively closes the
@@ -94,6 +95,12 @@ the cached file again. Unpaired and unsupported packets reject their payloads so
 Android's serial sender can continue. Upload cancellation covers channel opening;
 failed metadata validation and transfer errors close streams and release retained
 channels. A failed packet send releases the device's queue lock for reconnects.
+Incoming payload claims are exclusive. File transfers reserve the original
+channel's payload before opening their destination, and release it even if that
+opening fails or the device reconnects. Rejected duplicate downloads close only
+their own output streams and cannot release another transfer's payload.
+Album art for a player that has disappeared is rejected too. Read loops remain
+bound to their original channel and discard a packet resolved after replacement.
 
 SFTP still requires IP networking and does not work over this transport.
 There is no new Bluetooth settings UI or automatic LAN preference/failover policy.

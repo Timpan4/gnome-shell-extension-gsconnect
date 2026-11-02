@@ -363,7 +363,9 @@ const Device = GObject.registerClass({
         try {
             let packet = null;
 
-            while ((packet = await this.channel.readPacket())) {
+            while (this.channel === channel && (packet = await channel.readPacket())) {
+                if (this.channel !== channel)
+                    break;
                 debug(packet, this.name);
                 this.handlePacket(packet);
             }
