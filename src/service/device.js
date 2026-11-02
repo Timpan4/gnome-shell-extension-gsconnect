@@ -189,14 +189,9 @@ const Device = GObject.registerClass({
         if (!this.channel)
             return '';
 
-        // Bluetooth connections have no certificate so we use the host address
-        if (this.connection_type === 'bluetooth') {
-            // TRANSLATORS: Bluetooth address for remote device
-            return _('Bluetooth device at %s').format('???');
-        }
-
         // FIXME: another ugly reach-around
-        const localCert = this.service.manager.backends.get('lan')?.certificate;
+        const localCert = this.channel.backend?.certificate ??
+            this.service.manager.backends.get('lan')?.certificate;
         const remoteCert = this.channel?.peer_certificate;
         if (!localCert || !remoteCert)
             return '';
@@ -337,6 +332,9 @@ const Device = GObject.registerClass({
         if (this.channel === channel)
             return;
 
+        // Approval belongs to the channel on which the request was made.
+        this._resetPairRequest();
+
         if (this.channel !== null)
             this.channel.close();
 
@@ -365,12 +363,14 @@ const Device = GObject.registerClass({
         try {
             let packet = null;
 
-            while ((packet = await this.channel.readPacket())) {
+            while (this.channel === channel && (packet = await channel.readPacket())) {
+                if (this.channel !== channel)
+                    break;
                 debug(packet, this.name);
                 this.handlePacket(packet);
             }
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.name);
 
             if (this.channel === channel)
@@ -437,15 +437,19 @@ const Device = GObject.registerClass({
                 return this._handlePair(packet);
 
             // The device must think we're paired; inform it we are not
-            if (!this.paired)
+            if (!this.paired) {
+                this.rejectTransfer(packet);
                 return this.unpair();
+            }
 
             const handler = this._handlers.get(packet.type);
 
-            if (handler !== undefined)
+            if (handler !== undefined) {
                 handler.handlePacket(packet);
-            else
+            } else {
+                this.rejectTransfer(packet);
                 debug(`Unsupported packet type (${packet.type})`, this.name);
+            }
         } catch (e) {
             debug(e, this.name);
         }
@@ -457,6 +461,7 @@ const Device = GObject.registerClass({
      * @param {object} packet - An object of packet data...
      */
     async sendPacket(packet) {
+        let ownsQueue = false;
         try {
             if (!this.connected)
                 return;
@@ -470,19 +475,24 @@ const Device = GObject.registerClass({
                 return;
 
             this._outputLock = true;
+            ownsQueue = true;
             let next;
 
             while ((next = this._outputQueue.shift())) {
-                await this.channel.sendPacket(next);
-                debug(next, this.name);
+                try {
+                    await this.channel.sendPacket(next);
+                    debug(next, this.name);
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        debug(e, this.name);
+                }
             }
-
-            this._outputLock = false;
         } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                 debug(e, this.name);
-
-            this._outputLock = false;
+        } finally {
+            if (ownsQueue)
+                this._outputLock = false;
         }
     }
 
@@ -494,6 +504,15 @@ const Device = GObject.registerClass({
         const acceptPair = new Gio.SimpleAction({name: 'pair'});
         acceptPair.connect('activate', this.pair.bind(this));
         this.add_action(acceptPair);
+
+        for (const [name, accept] of [['acceptPair', true], ['rejectPair', false]]) {
+            const response = new Gio.SimpleAction({
+                name,
+                parameter_type: new GLib.VariantType('s'),
+            });
+            response.connect('activate', this._respondPair.bind(this, accept));
+            this.add_action(response);
+        }
 
         const rejectPair = new Gio.SimpleAction({name: 'unpair'});
         rejectPair.connect('activate', this.unpair.bind(this));
@@ -855,6 +874,8 @@ const Device = GObject.registerClass({
         // Reset any active request
         this._resetPairRequest();
 
+        this._pairRequestToken = GLib.uuid_string_random();
+        this._pairRequestChannel = this.channel;
         this._pairingTimestamp = timestamp;
         this.showNotification({
             id: 'pair-request',
@@ -865,14 +886,14 @@ const Device = GObject.registerClass({
             priority: Gio.NotificationPriority.URGENT,
             buttons: [
                 {
-                    action: 'unpair',
+                    action: 'rejectPair',
                     label: _('Reject'),
-                    parameter: null,
+                    parameter: new GLib.Variant('s', this._pairRequestToken),
                 },
                 {
-                    action: 'pair',
+                    action: 'acceptPair',
                     label: _('Accept'),
-                    parameter: null,
+                    parameter: new GLib.Variant('s', this._pairRequestToken),
                 },
             ],
         });
@@ -889,6 +910,8 @@ const Device = GObject.registerClass({
      * Reset pair request timeouts and withdraw any notifications
      */
     _resetPairRequest() {
+        this._pairRequestToken = null;
+        this._pairRequestChannel = null;
         this.hideNotification('pair-request');
 
         if (this._incomingPairRequest) {
@@ -905,6 +928,24 @@ const Device = GObject.registerClass({
     }
 
     /**
+     * Apply a notification response only to its original request and channel.
+     *
+     * @param {boolean} accept - Whether the user accepted
+     * @param {Gio.SimpleAction} action - Notification action
+     * @param {GLib.Variant} parameter - Request token
+     */
+    _respondPair(accept, action, parameter) {
+        if (!this._incomingPairRequest || !this.channel || this.channel.closed ||
+            this.channel !== this._pairRequestChannel ||
+            parameter?.unpack() !== this._pairRequestToken)
+            return;
+        if (accept)
+            this.pair();
+        else
+            this.unpair();
+    }
+
+    /**
      * Set the internal paired state of the device and emit ::notify
      *
      * @param {boolean} paired - The paired state to set
@@ -912,8 +953,13 @@ const Device = GObject.registerClass({
     _setPaired(paired) {
         this._resetPairRequest();
 
-        // For TCP connections we store or reset the TLS Certificate
-        if (this.connection_type === 'lan') {
+        if (!paired)
+            this.settings.reset('bluetooth-peer');
+        else if (this.connection_type === 'bluetooth')
+            this.settings.set_string('bluetooth-peer', this.channel.path);
+
+        // Pin certificates for both LAN and authenticated Bluetooth links.
+        if (this.connection_type === 'lan' || this.connection_type === 'bluetooth') {
             if (paired) {
                 this.settings.set_string(
                     'certificate-pem',
@@ -932,7 +978,7 @@ const Device = GObject.registerClass({
             this._procs.clear();
 
             for (const transfer of this._transfers.values())
-                transfer.close();
+                transfer.cancel();
 
             this._transfers.clear();
         }
@@ -949,10 +995,11 @@ const Device = GObject.registerClass({
             // If we're accepting an incoming pair request, set the internal
             // paired state and send the confirmation before loading plugins.
             if (this._incomingPairRequest) {
-                if (this.identity?.body.protocolVersion >= 8) {
+                if (this.channel?.identity.body.protocolVersion >= 8) {
                     const currentTimestamp = Math.floor(Date.now() / 1000);
-                    const diffTimestamp = Number.abs(this._pairingTimestamp - currentTimestamp);
-                    if (diffTimestamp > ALLOWED_TIMESTAMP_TIME_DIFFERENCE_SECONDS) {
+                    if (!Number.isFinite(this._pairingTimestamp) ||
+                        Math.abs(this._pairingTimestamp - currentTimestamp) >
+                        ALLOWED_TIMESTAMP_TIME_DIFFERENCE_SECONDS) {
                         this._setPaired(false);
                         this.showNotification({
                             id: 'pair-request',

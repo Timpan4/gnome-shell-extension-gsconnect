@@ -669,14 +669,25 @@ export const Transfer = GObject.registerClass({
                     });
                 }
 
-                await this._ensureStream(item, this._cancellable);
+                // Reserve incoming Bluetooth payloads before opening a target.
+                // Use the original channel even if the device reconnects.
+                const channel = this.channel;
+                let payload = null;
+                try {
+                    if (item.packet.hasPayload())
+                        payload = channel.claimPayload?.(item.packet) ?? null;
+                    await this._ensureStream(item, this._cancellable);
 
-                if (item.packet.hasPayload()) {
-                    await this.channel.download(item.packet, item.target,
-                        this._cancellable);
-                } else {
-                    await this.channel.upload(item.packet, item.source,
-                        item.size, this._cancellable);
+                    if (item.packet.hasPayload()) {
+                        await channel.download(item.packet, item.target,
+                            this._cancellable, payload);
+                    } else {
+                        await channel.upload(item.packet, item.source,
+                            item.size, this._cancellable);
+                    }
+                } finally {
+                    if (payload)
+                        channel.releasePayload(payload);
                 }
             }
         } catch (e) {

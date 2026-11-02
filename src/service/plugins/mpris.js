@@ -150,8 +150,10 @@ const MPRISPlugin = GObject.registerClass({
     _handlePlayerUpdate(packet) {
         const player = this._players.get(packet.body.player);
 
-        if (player === undefined)
+        if (player === undefined) {
+            this.device.rejectTransfer(packet);
             return;
+        }
 
         if (packet.body.hasOwnProperty('transferringAlbumArt'))
             player.handleAlbumArt(packet);

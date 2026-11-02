@@ -55,6 +55,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
   <!-- Device Settings -->
   <schema id="org.gnome.Shell.Extensions.GSConnect.Device">
+    <key name="bluetooth-peer" type="s">
+      <default>""</default>
+      <summary>BlueZ peer approved during GSConnect Bluetooth pairing</summary>
+    </key>
     <key name="certificate-pem" type="s">
       <default>""</default>
     </key>
